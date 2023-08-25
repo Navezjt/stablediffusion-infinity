@@ -1,3 +1,9 @@
+import subprocess
+# import os.path as osp
+import pip
+# pip.main(["install","-v","-U","git+https://github.com/facebookresearch/xformers.git@main#egg=xformers"])
+# subprocess.check_call("pip install -v -U git+https://github.com/facebookresearch/xformers.git@main#egg=xformers", cwd=osp.dirname(__file__), shell=True)
+
 import io
 import base64
 import os
@@ -7,9 +13,6 @@ import numpy as np
 import torch
 from torch import autocast
 import diffusers
-
-assert tuple(map(int,diffusers.__version__.split(".")))  >= (0,9,0), "Please upgrade diffusers to 0.9.0"
-
 from diffusers.configuration_utils import FrozenDict
 from diffusers import (
     StableDiffusionPipeline,
@@ -18,10 +21,8 @@ from diffusers import (
     StableDiffusionInpaintPipelineLegacy,
     DDIMScheduler,
     LMSDiscreteScheduler,
-    DiffusionPipeline,
     StableDiffusionUpscalePipeline,
-    DPMSolverMultistepScheduler,
-    PNDMScheduler,
+    DPMSolverMultistepScheduler
 )
 from diffusers.models import AutoencoderKL
 from PIL import Image
@@ -33,7 +34,6 @@ import skimage.measure
 import yaml
 import json
 from enum import Enum
-from utils import *
 
 try:
     abspath = os.path.abspath(__file__)
@@ -42,10 +42,9 @@ try:
 except:
     pass
 
-try:
-    from interrogate import Interrogator
-except:
-    Interrogator = DummyInterrogator
+from utils import *
+
+assert diffusers.__version__ >= "0.6.0", "Please upgrade diffusers to 0.6.0"
 
 USE_NEW_DIFFUSERS = True
 RUN_IN_SPACE = "RUN_IN_HG_SPACE" in os.environ
@@ -53,13 +52,9 @@ RUN_IN_SPACE = "RUN_IN_HG_SPACE" in os.environ
 
 class ModelChoice(Enum):
     INPAINTING = "stablediffusion-inpainting"
-    INPAINTING2 = "stablediffusion-2-inpainting"
-    INPAINTING_IMG2IMG = "stablediffusion-inpainting+img2img-1.5"
-    MODEL_2_1 = "stablediffusion-2.1"
-    MODEL_2_0_V = "stablediffusion-2.0v"
-    MODEL_2_0 = "stablediffusion-2.0"
-    MODEL_1_5 = "stablediffusion-1.5"
-    MODEL_1_4 = "stablediffusion-1.4"
+    INPAINTING_IMG2IMG = "stablediffusion-inpainting+img2img-v1.5"
+    MODEL_1_5 = "stablediffusion-v1.5"
+    MODEL_1_4 = "stablediffusion-v1.4"
 
 
 try:
@@ -76,16 +71,6 @@ USE_GLID = False
 #     USE_GLID = False
 
 try:
-    import onnxruntime
-    onnx_available = True
-    onnx_providers = ["CUDAExecutionProvider", "DmlExecutionProvider", "OpenVINOExecutionProvider", 'CPUExecutionProvider']
-    available_providers = onnxruntime.get_available_providers()
-    onnx_providers = [item for item in onnx_providers if item in available_providers]
-except:
-    onnx_available = False
-    onnx_providers = []
-
-try:
     cuda_available = torch.cuda.is_available()
 except:
     cuda_available = False
@@ -97,10 +82,9 @@ finally:
     else:
         device = "cpu"
 
-if device != "cuda":
-    import contextlib
+import contextlib
 
-    autocast = contextlib.nullcontext
+autocast = contextlib.nullcontext
 
 with open("config.yaml", "r") as yaml_in:
     yaml_object = yaml.safe_load(yaml_in)
@@ -163,7 +147,6 @@ parser.add_argument("--host", type=str, help="host", dest="server_name")
 parser.add_argument("--share", action="store_true", help="share this app?")
 parser.add_argument("--debug", action="store_true", help="debug mode")
 parser.add_argument("--fp32", action="store_true", help="using full precision")
-parser.add_argument("--lowvram", action="store_true", help="using lowvram mode")
 parser.add_argument("--encrypt", action="store_true", help="using https?")
 parser.add_argument("--ssl_keyfile", type=str, help="path to ssl_keyfile")
 parser.add_argument("--ssl_certfile", type=str, help="path to ssl_certfile")
@@ -181,10 +164,10 @@ parser.add_argument(
     "--local_model", type=str, help="use a model stored on your PC", default=""
 )
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not RUN_IN_SPACE:
     args = parser.parse_args()
 else:
-    args = parser.parse_args(["--debug"])
+    args = parser.parse_args()
 # args = parser.parse_args(["--debug"])
 if args.auth is not None:
     args.auth = tuple(args.auth)
@@ -234,7 +217,7 @@ def my_resize(width, height):
         factor = 1.25
     elif smaller < 450:
         factor = 1.125
-    return int(factor * width) // 8 * 8, int(factor * height) // 8 * 8
+    return int(factor * width)//8*8, int(factor * height)//8*8
 
 
 def load_learned_embed_in_clip(
@@ -267,7 +250,7 @@ def load_learned_embed_in_clip(
     text_encoder.get_input_embeddings().weight.data[token_id] = embeds
 
 
-scheduler_dict = {"PLMS": None, "DDIM": None, "K-LMS": None, "DPM": None, "PNDM": None}
+scheduler_dict = {"PLMS": None, "DDIM": None, "K-LMS": None, "DPM": None}
 
 
 class StableDiffusionInpaint:
@@ -276,64 +259,61 @@ class StableDiffusionInpaint:
     ):
         self.token = token
         original_checkpoint = False
-        if device == "cpu" and onnx_available:
-            from diffusers import OnnxStableDiffusionInpaintPipeline
-            inpaint = OnnxStableDiffusionInpaintPipeline.from_pretrained(
-                model_name,
-                revision="onnx",
-                provider=onnx_providers[0] if onnx_providers else None
-                )
-        else:
-            if model_path and os.path.exists(model_path):
-                if model_path.endswith(".ckpt"):
-                    original_checkpoint = True
-                elif model_path.endswith(".json"):
-                    model_name = os.path.dirname(model_path)
-                else:
-                    model_name = model_path
-            vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
-            if device == "cuda" and not args.fp32:
-                vae.to(torch.float16)
-            if original_checkpoint:
-                print(f"Converting & Loading {model_path}")
-                from convert_checkpoint import convert_checkpoint
+        if model_path and os.path.exists(model_path):
+            if model_path.endswith(".ckpt"):
+                original_checkpoint = True
+            elif model_path.endswith(".json"):
+                model_name = os.path.dirname(model_path)
+            else:
+                model_name = model_path
+        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+        vae.to(torch.float16)
+        if original_checkpoint:
+            print(f"Converting & Loading {model_path}")
+            from convert_checkpoint import convert_checkpoint
 
-                pipe = convert_checkpoint(model_path, inpainting=True)
-                if device == "cuda" and not args.fp32:
-                    pipe.to(torch.float16)
-                inpaint = StableDiffusionInpaintPipeline(
-                    vae=vae,
-                    text_encoder=pipe.text_encoder,
-                    tokenizer=pipe.tokenizer,
-                    unet=pipe.unet,
-                    scheduler=pipe.scheduler,
-                    safety_checker=pipe.safety_checker,
-                    feature_extractor=pipe.feature_extractor,
+            pipe = convert_checkpoint(model_path, inpainting=True)
+            if device == "cuda":
+                pipe.to(torch.float16)
+            inpaint = StableDiffusionInpaintPipeline(
+                vae=vae,
+                text_encoder=pipe.text_encoder,
+                tokenizer=pipe.tokenizer,
+                unet=pipe.unet,
+                scheduler=pipe.scheduler,
+                safety_checker=pipe.safety_checker,
+                feature_extractor=pipe.feature_extractor,
+            )
+        else:
+            print(f"Loading {model_name}")
+            if device == "cuda":
+                inpaint = StableDiffusionInpaintPipeline.from_pretrained(
+                    model_name,
+                    revision="fp16",
+                    torch_dtype=torch.float16,
+                    use_auth_token=token,
+                    vae=vae
                 )
             else:
-                print(f"Loading {model_name}")
-                if device == "cuda" and not args.fp32:
-                    inpaint = StableDiffusionInpaintPipeline.from_pretrained(
-                        model_name,
-                        revision="fp16",
-                        torch_dtype=torch.float16,
-                        use_auth_token=token,
-                        vae=vae,
+                inpaint = StableDiffusionInpaintPipeline.from_pretrained(
+                    model_name, use_auth_token=token,
+                )
+        if os.path.exists("./embeddings"):
+            print("Note that StableDiffusionInpaintPipeline + embeddings is untested")
+            for item in os.listdir("./embeddings"):
+                if item.endswith(".bin"):
+                    load_learned_embed_in_clip(
+                        os.path.join("./embeddings", item),
+                        inpaint.text_encoder,
+                        inpaint.tokenizer,
                     )
-                else:
-                    inpaint = StableDiffusionInpaintPipeline.from_pretrained(
-                        model_name, use_auth_token=token, vae=vae
-                    )
-            if os.path.exists("./embeddings"):
-                print("Note that StableDiffusionInpaintPipeline + embeddings is untested")
-                for item in os.listdir("./embeddings"):
-                    if item.endswith(".bin"):
-                        load_learned_embed_in_clip(
-                            os.path.join("./embeddings", item),
-                            inpaint.text_encoder,
-                            inpaint.tokenizer,
-                        )
-            inpaint.to(device)
+        inpaint.to(device)
+        # try:
+            # inpaint.vae=torch.compile(inpaint.vae, dynamic=True)
+            # inpaint.unet=torch.compile(inpaint.unet, dynamic=True)
+        # except Exception as e:
+            # print(e)
+        # inpaint.enable_xformers_memory_efficient_attention()
         # if device == "mps":
         # _ = text2img("", num_inference_steps=1)
         scheduler_dict["PLMS"] = inpaint.scheduler
@@ -351,12 +331,6 @@ class StableDiffusionInpaint:
                 beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
             )
         )
-        scheduler_dict["PNDM"] = prepare_scheduler(
-            PNDMScheduler(
-                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
-                skip_prk_steps=True
-            )
-        )
         scheduler_dict["DPM"] = prepare_scheduler(
             DPMSolverMultistepScheduler.from_config(inpaint.scheduler.config)
         )
@@ -366,9 +340,8 @@ class StableDiffusionInpaint:
             total_memory = torch.cuda.get_device_properties(0).total_memory // (
                 1024 ** 3
             )
-            if total_memory <= 5 or args.lowvram:
+            if total_memory <= 5:
                 inpaint.enable_attention_slicing()
-                inpaint.enable_sequential_cpu_offload()
         except:
             pass
         self.inpaint = inpaint
@@ -396,7 +369,7 @@ class StableDiffusionInpaint:
         selected_scheduler = scheduler_dict.get(scheduler, scheduler_dict["PLMS"])
         for item in [inpaint]:
             item.scheduler = selected_scheduler
-            if enable_safety or self.safety_checker is None:
+            if enable_safety:
                 item.safety_checker = self.safety_checker
             else:
                 item.safety_checker = lambda images, **kwargs: (images, False)
@@ -409,8 +382,8 @@ class StableDiffusionInpaint:
         process_height = height
         if resize_check:
             process_width, process_height = my_resize(width, height)
-        process_width = process_width * 8 // 8
-        process_height = process_height * 8 // 8
+        process_width=process_width*8//8
+        process_height=process_height*8//8
         extra_kwargs = {
             "num_inference_steps": step,
             "guidance_scale": guidance_scale,
@@ -423,16 +396,11 @@ class StableDiffusionInpaint:
             generator = torch.Generator(inpaint.device).manual_seed(seed_val)
             extra_kwargs["generator"] = generator
         if True:
-            if fill_mode == "g_diffuser":
-                mask = 255 - mask
-                mask = mask[:, :, np.newaxis].repeat(3, axis=2)
-                img, mask = functbl[fill_mode](img, mask)
-            else:
-                img, mask = functbl[fill_mode](img, mask)
-                mask = 255 - mask
-                mask = skimage.measure.block_reduce(mask, (8, 8), np.max)
-                mask = mask.repeat(8, axis=0).repeat(8, axis=1)
-            # extra_kwargs["strength"] = strength
+            img, mask = functbl[fill_mode](img, mask)
+            mask = 255 - mask
+            mask = skimage.measure.block_reduce(mask, (8, 8), np.max)
+            mask = mask.repeat(8, axis=0).repeat(8, axis=1)
+            extra_kwargs["strength"] = strength
             inpaint_func = inpaint
             init_image = Image.fromarray(img)
             mask_image = Image.fromarray(mask)
@@ -462,134 +430,74 @@ class StableDiffusion:
     ):
         self.token = token
         original_checkpoint = False
-        if device=="cpu" and onnx_available:
-            from diffusers import OnnxStableDiffusionPipeline, OnnxStableDiffusionInpaintPipelineLegacy, OnnxStableDiffusionImg2ImgPipeline
-            text2img = OnnxStableDiffusionPipeline.from_pretrained(
-                model_name,
-                revision="onnx",
-                provider=onnx_providers[0] if onnx_providers else None
+        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+        vae.to(torch.float16)
+        if model_path and os.path.exists(model_path):
+            if model_path.endswith(".ckpt"):
+                original_checkpoint = True
+            elif model_path.endswith(".json"):
+                model_name = os.path.dirname(model_path)
+            else:
+                model_name = model_path
+        if original_checkpoint:
+            print(f"Converting & Loading {model_path}")
+            from convert_checkpoint import convert_checkpoint
+
+            text2img = convert_checkpoint(model_path)
+            if device == "cuda" and not args.fp32:
+                text2img.to(torch.float16)
+        else:
+            print(f"Loading {model_name}")
+            if device == "cuda" and not args.fp32:
+                text2img = StableDiffusionPipeline.from_pretrained(
+                    "runwayml/stable-diffusion-v1-5",
+                    revision="fp16",
+                    torch_dtype=torch.float16,
+                    use_auth_token=token,
+                    vae=vae
                 )
-            inpaint = OnnxStableDiffusionInpaintPipelineLegacy(
-                    vae_encoder=text2img.vae_encoder,
-                    vae_decoder=text2img.vae_decoder,
-                    text_encoder=text2img.text_encoder,
-                    tokenizer=text2img.tokenizer,
-                    unet=text2img.unet,
-                    scheduler=text2img.scheduler,
-                    safety_checker=text2img.safety_checker,
-                    feature_extractor=text2img.feature_extractor,
+            else:
+                text2img = StableDiffusionPipeline.from_pretrained(
+                    model_name, use_auth_token=token,
                 )
-            img2img = OnnxStableDiffusionImg2ImgPipeline(
-                vae_encoder=text2img.vae_encoder,
-                vae_decoder=text2img.vae_decoder,
-                text_encoder=text2img.text_encoder,
-                tokenizer=text2img.tokenizer,
-                unet=text2img.unet,
-                scheduler=text2img.scheduler,
-                safety_checker=text2img.safety_checker,
-                feature_extractor=text2img.feature_extractor,
+        if inpainting_model:
+            # can reduce vRAM by reusing models except unet
+            text2img_unet = text2img.unet
+            del text2img.vae
+            del text2img.text_encoder
+            del text2img.tokenizer
+            del text2img.scheduler
+            del text2img.safety_checker
+            del text2img.feature_extractor
+            import gc
+
+            gc.collect()
+            if device == "cuda":
+                inpaint = StableDiffusionInpaintPipeline.from_pretrained(
+                    "runwayml/stable-diffusion-inpainting",
+                    revision="fp16",
+                    torch_dtype=torch.float16,
+                    use_auth_token=token,
+                    vae=vae
+                ).to(device)
+            else:
+                inpaint = StableDiffusionInpaintPipeline.from_pretrained(
+                    "runwayml/stable-diffusion-inpainting", use_auth_token=token,
+                ).to(device)
+            text2img_unet.to(device)
+            del text2img
+            gc.collect()
+            text2img = StableDiffusionPipeline(
+                vae=inpaint.vae,
+                text_encoder=inpaint.text_encoder,
+                tokenizer=inpaint.tokenizer,
+                unet=text2img_unet,
+                scheduler=inpaint.scheduler,
+                safety_checker=inpaint.safety_checker,
+                feature_extractor=inpaint.feature_extractor,
             )
         else:
-            if model_path and os.path.exists(model_path):
-                if model_path.endswith(".ckpt"):
-                    original_checkpoint = True
-                elif model_path.endswith(".json"):
-                    model_name = os.path.dirname(model_path)
-                else:
-                    model_name = model_path
-            vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
-            if device == "cuda" and not args.fp32:
-                vae.to(torch.float16)
-            if original_checkpoint:
-                print(f"Converting & Loading {model_path}")
-                from convert_checkpoint import convert_checkpoint
-
-                pipe = convert_checkpoint(model_path)
-                if device == "cuda" and not args.fp32:
-                    pipe.to(torch.float16)
-                text2img = StableDiffusionPipeline(
-                    vae=vae,
-                    text_encoder=pipe.text_encoder,
-                    tokenizer=pipe.tokenizer,
-                    unet=pipe.unet,
-                    scheduler=pipe.scheduler,
-                    safety_checker=pipe.safety_checker,
-                    feature_extractor=pipe.feature_extractor,
-                )
-            else:
-                print(f"Loading {model_name}")
-                if device == "cuda" and not args.fp32:
-                    text2img = StableDiffusionPipeline.from_pretrained(
-                        model_name,
-                        revision="fp16",
-                        torch_dtype=torch.float16,
-                        use_auth_token=token,
-                        vae=vae,
-                    )
-                else:
-                    text2img = StableDiffusionPipeline.from_pretrained(
-                        model_name, use_auth_token=token, vae=vae
-                    )
-            if inpainting_model:
-                # can reduce vRAM by reusing models except unet
-                text2img_unet = text2img.unet
-                del text2img.vae
-                del text2img.text_encoder
-                del text2img.tokenizer
-                del text2img.scheduler
-                del text2img.safety_checker
-                del text2img.feature_extractor
-                import gc
-
-                gc.collect()
-                if device == "cuda" and not args.fp32:
-                    inpaint = StableDiffusionInpaintPipeline.from_pretrained(
-                        "runwayml/stable-diffusion-inpainting",
-                        revision="fp16",
-                        torch_dtype=torch.float16,
-                        use_auth_token=token,
-                        vae=vae,
-                    ).to(device)
-                else:
-                    inpaint = StableDiffusionInpaintPipeline.from_pretrained(
-                        "runwayml/stable-diffusion-inpainting",
-                        use_auth_token=token,
-                        vae=vae,
-                    ).to(device)
-                text2img_unet.to(device)
-                text2img = StableDiffusionPipeline(
-                    vae=inpaint.vae,
-                    text_encoder=inpaint.text_encoder,
-                    tokenizer=inpaint.tokenizer,
-                    unet=text2img_unet,
-                    scheduler=inpaint.scheduler,
-                    safety_checker=inpaint.safety_checker,
-                    feature_extractor=inpaint.feature_extractor,
-                )
-            else:
-                inpaint = StableDiffusionInpaintPipelineLegacy(
-                    vae=text2img.vae,
-                    text_encoder=text2img.text_encoder,
-                    tokenizer=text2img.tokenizer,
-                    unet=text2img.unet,
-                    scheduler=text2img.scheduler,
-                    safety_checker=text2img.safety_checker,
-                    feature_extractor=text2img.feature_extractor,
-                ).to(device)
-            text_encoder = text2img.text_encoder
-            tokenizer = text2img.tokenizer
-            if os.path.exists("./embeddings"):
-                for item in os.listdir("./embeddings"):
-                    if item.endswith(".bin"):
-                        load_learned_embed_in_clip(
-                            os.path.join("./embeddings", item),
-                            text2img.text_encoder,
-                            text2img.tokenizer,
-                        )
-            text2img.to(device)
-            if device == "mps":
-                _ = text2img("", num_inference_steps=1)
-            img2img = StableDiffusionImg2ImgPipeline(
+            inpaint = StableDiffusionInpaintPipelineLegacy(
                 vae=text2img.vae,
                 text_encoder=text2img.text_encoder,
                 tokenizer=text2img.tokenizer,
@@ -598,6 +506,19 @@ class StableDiffusion:
                 safety_checker=text2img.safety_checker,
                 feature_extractor=text2img.feature_extractor,
             ).to(device)
+        text_encoder = text2img.text_encoder
+        tokenizer = text2img.tokenizer
+        if os.path.exists("./embeddings"):
+            for item in os.listdir("./embeddings"):
+                if item.endswith(".bin"):
+                    load_learned_embed_in_clip(
+                        os.path.join("./embeddings", item),
+                        text2img.text_encoder,
+                        text2img.tokenizer,
+                    )
+        text2img.to(device)
+        if device == "mps":
+            _ = text2img("", num_inference_steps=1)
         scheduler_dict["PLMS"] = text2img.scheduler
         scheduler_dict["DDIM"] = prepare_scheduler(
             DDIMScheduler(
@@ -613,44 +534,40 @@ class StableDiffusion:
                 beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
             )
         )
-        scheduler_dict["PNDM"] = prepare_scheduler(
-            PNDMScheduler(
-                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
-                skip_prk_steps=True
-            )
-        )
         scheduler_dict["DPM"] = prepare_scheduler(
             DPMSolverMultistepScheduler.from_config(text2img.scheduler.config)
         )
         self.safety_checker = text2img.safety_checker
+        img2img = StableDiffusionImg2ImgPipeline(
+            vae=text2img.vae,
+            text_encoder=text2img.text_encoder,
+            tokenizer=text2img.tokenizer,
+            unet=text2img.unet,
+            scheduler=text2img.scheduler,
+            safety_checker=text2img.safety_checker,
+            feature_extractor=text2img.feature_extractor,
+        ).to(device)
         save_token(token)
         try:
             total_memory = torch.cuda.get_device_properties(0).total_memory // (
                 1024 ** 3
             )
-            if total_memory <= 5 or args.lowvram:
+            if total_memory <= 5:
                 inpaint.enable_attention_slicing()
-                inpaint.enable_sequential_cpu_offload()
-                if inpainting_model:
-                    text2img.enable_attention_slicing()
-                    text2img.enable_sequential_cpu_offload()
         except:
             pass
         self.text2img = text2img
         self.inpaint = inpaint
         self.img2img = img2img
-        if True:
-            self.unified = inpaint
-        else:
-            self.unified = UnifiedPipeline(
-                vae=text2img.vae,
-                text_encoder=text2img.text_encoder,
-                tokenizer=text2img.tokenizer,
-                unet=text2img.unet,
-                scheduler=text2img.scheduler,
-                safety_checker=text2img.safety_checker,
-                feature_extractor=text2img.feature_extractor,
-            ).to(device)
+        self.unified = UnifiedPipeline(
+            vae=text2img.vae,
+            text_encoder=text2img.text_encoder,
+            tokenizer=text2img.tokenizer,
+            unet=text2img.unet,
+            scheduler=text2img.scheduler,
+            safety_checker=text2img.safety_checker,
+            feature_extractor=text2img.feature_extractor,
+        ).to(device)
         self.inpainting_model = inpainting_model
 
     def run(
@@ -681,7 +598,7 @@ class StableDiffusion:
         selected_scheduler = scheduler_dict.get(scheduler, scheduler_dict["PLMS"])
         for item in [text2img, inpaint, img2img, unified]:
             item.scheduler = selected_scheduler
-            if enable_safety or self.safety_checker is None:
+            if enable_safety:
                 item.safety_checker = self.safety_checker
             else:
                 item.safety_checker = lambda images, **kwargs: (images, False)
@@ -717,7 +634,7 @@ class StableDiffusion:
             if True:
                 images = img2img(
                     prompt=prompt,
-                    image=init_image.resize(
+                    init_image=init_image.resize(
                         (process_width, process_height), resample=SAMPLING_MODE
                     ),
                     strength=strength,
@@ -727,40 +644,33 @@ class StableDiffusion:
             if fill_mode == "g_diffuser" and not self.inpainting_model:
                 mask = 255 - mask
                 mask = mask[:, :, np.newaxis].repeat(3, axis=2)
-                img, mask = functbl[fill_mode](img, mask)
+                img, mask, out_mask = functbl[fill_mode](img, mask)
                 extra_kwargs["strength"] = 1.0
-                extra_kwargs["out_mask"] = Image.fromarray(mask)
+                extra_kwargs["out_mask"] = Image.fromarray(out_mask)
                 inpaint_func = unified
             else:
                 img, mask = functbl[fill_mode](img, mask)
                 mask = 255 - mask
                 mask = skimage.measure.block_reduce(mask, (8, 8), np.max)
                 mask = mask.repeat(8, axis=0).repeat(8, axis=1)
+                extra_kwargs["strength"] = strength
                 inpaint_func = inpaint
             init_image = Image.fromarray(img)
             mask_image = Image.fromarray(mask)
             # mask_image=mask_image.filter(ImageFilter.GaussianBlur(radius = 8))
-            input_image = init_image.resize(
-                (process_width, process_height), resample=SAMPLING_MODE
-            )
-            if self.inpainting_model:
+            if True:
+                input_image = init_image.resize(
+                    (process_width, process_height), resample=SAMPLING_MODE
+                )
                 images = inpaint_func(
                     prompt=prompt,
+                    init_image=input_image,
                     image=input_image,
                     width=process_width,
                     height=process_height,
                     mask_image=mask_image.resize((process_width, process_height)),
                     **extra_kwargs,
                 )["images"]
-            else:
-                extra_kwargs["strength"] = strength
-                if True:
-                    images = inpaint_func(
-                        prompt=prompt,
-                        image=input_image,
-                        mask_image=mask_image.resize((process_width, process_height)),
-                        **extra_kwargs,
-                    )["images"]
         else:
             if True:
                 images = text2img(
@@ -775,22 +685,9 @@ class StableDiffusion:
 def get_model(token="", model_choice="", model_path=""):
     if "model" not in model:
         model_name = ""
-        if args.local_model:
-            print(f"Using local_model: {args.local_model}")
-            model_path = args.local_model
-        elif args.remote_model:
-            print(f"Using remote_model: {args.remote_model}")
-            model_name = args.remote_model
         if model_choice == ModelChoice.INPAINTING.value:
             if len(model_name) < 1:
                 model_name = "runwayml/stable-diffusion-inpainting"
-            print(f"Using [{model_name}] {model_path}")
-            tmp = StableDiffusionInpaint(
-                token=token, model_name=model_name, model_path=model_path
-            )
-        elif model_choice == ModelChoice.INPAINTING2.value:
-            if len(model_name) < 1:
-                model_name = "stabilityai/stable-diffusion-2-inpainting"
             print(f"Using [{model_name}] {model_path}")
             tmp = StableDiffusionInpaint(
                 token=token, model_name=model_name, model_path=model_path
@@ -799,7 +696,7 @@ def get_model(token="", model_choice="", model_path=""):
             print(
                 f"Note that {ModelChoice.INPAINTING_IMG2IMG.value} only support remote model and requires larger vRAM"
             )
-            tmp = StableDiffusion(token=token, inpainting_model=True)
+            tmp = StableDiffusion(token=token, model_name="runwayml/stable-diffusion-v1-5", inpainting_model=True)
         else:
             if len(model_name) < 1:
                 model_name = (
@@ -807,12 +704,6 @@ def get_model(token="", model_choice="", model_path=""):
                     if model_choice == ModelChoice.MODEL_1_5.value
                     else "CompVis/stable-diffusion-v1-4"
                 )
-                if model_choice == ModelChoice.MODEL_2_0.value:
-                    model_name = "stabilityai/stable-diffusion-2-base"
-                elif model_choice == ModelChoice.MODEL_2_0_V.value:
-                    model_name = "stabilityai/stable-diffusion-2"
-                elif model_choice == ModelChoice.MODEL_2_1.value:
-                    model_name = "stabilityai/stable-diffusion-2-1-base"
             tmp = StableDiffusion(
                 token=token, model_name=model_name, model_path=model_path
             )
@@ -837,29 +728,10 @@ def run_outpaint(
     generate_num,
     scheduler,
     scheduler_eta,
-    interrogate_mode,
     state,
 ):
     data = base64.b64decode(str(sel_buffer_str))
     pil = Image.open(io.BytesIO(data))
-    if interrogate_mode:
-        if "interrogator" not in model:
-            model["interrogator"] = Interrogator()
-        interrogator = model["interrogator"]
-        img = np.array(pil)[:, :, 0:3]
-        mask = np.array(pil)[:, :, -1]
-        x, y = np.nonzero(mask)
-        if len(x) > 0:
-            x0, x1 = x.min(), x.max() + 1
-            y0, y1 = y.min(), y.max() + 1
-            img = img[x0:x1, y0:y1, :]
-        pil = Image.fromarray(img)
-        interrogate_ret = interrogator.interrogate(pil)
-        return (
-            gr.update(value=",".join([sel_buffer_str]),),
-            gr.update(label="Prompt", value=interrogate_ret),
-            state,
-        )
     width, height = pil.size
     sel_buffer = np.array(pil)
     cur_model = get_model()
@@ -928,10 +800,7 @@ proceed_button_js = load_js("proceed")
 setup_button_js = load_js("setup")
 
 if RUN_IN_SPACE:
-    get_model(
-        token=os.environ.get("hftoken", ""),
-        model_choice=ModelChoice.INPAINTING_IMG2IMG.value,
-    )
+    get_model(token=os.environ.get("hftoken", ""), model_choice=ModelChoice.INPAINTING.value)
 
 blocks = gr.Blocks(
     title="StableDiffusion-Infinity",
@@ -950,7 +819,7 @@ with blocks as demo:
     # title
     title = gr.Markdown(
         """
-    **stablediffusion-infinity**: Outpainting with Stable Diffusion on an infinite canvas: [https://github.com/lkwq007/stablediffusion-infinity](https://github.com/lkwq007/stablediffusion-infinity)
+    **stablediffusion-infinity**: Outpainting with Stable Diffusion on an infinite canvas: [https://github.com/lkwq007/stablediffusion-infinity](https://github.com/lkwq007/stablediffusion-infinity)  \[[Open In Colab](https://colab.research.google.com/github/lkwq007/stablediffusion-infinity/blob/master/stablediffusion_infinity_colab.ipynb)\]  \[[Setup Locally](https://github.com/lkwq007/stablediffusion-infinity/blob/master/docs/setup_guide.md)\] 
     """,
         elem_id="markdown",
     )
@@ -974,9 +843,9 @@ with blocks as demo:
                 )
             with gr.Column(scale=3, min_width=320):
                 model_selection = gr.Radio(
-                    label="Choose a model type here",
+                    label="Choose a model here",
                     choices=model_choices_lst,
-                    value=ModelChoice.INPAINTING.value if onnx_available else ModelChoice.INPAINTING2.value,
+                    value=ModelChoice.INPAINTING.value,
                 )
             with gr.Column(scale=1, min_width=100):
                 canvas_width = gr.Number(
@@ -1001,7 +870,7 @@ with blocks as demo:
                 )
         model_path_input = gr.Textbox(
             value=model_path_input_val,
-            label="Custom Model Path (You have to select a correct model type for your local model)",
+            label="Custom Model Path",
             placeholder="Ignore this if you are not using Docker",
             elem_id="model_path_input",
         )
@@ -1017,15 +886,14 @@ with blocks as demo:
                     "cv2_telea",
                     "perlin",
                     "gaussian",
-                    "g_diffuser",
                 ],
-                value="patchmatch",
+                value="cv2_ns",
                 type="value",
             )
             postprocess_check = gr.Radio(
                 label="Photometric Correction Mode",
                 choices=["disabled", "mask_mode", "border_mode",],
-                value="disabled",
+                value="mask_mode",
                 type="value",
             )
             # canvas control
@@ -1049,7 +917,7 @@ with blocks as demo:
                         label="Strength",
                         minimum=0.0,
                         maximum=1.0,
-                        value=1.0,
+                        value=0.75,
                         step=0.01,
                     )
                 with gr.Row():
@@ -1079,7 +947,6 @@ with blocks as demo:
     sd_img2img = gr.Checkbox(label="Enable Img2Img", value=False, visible=False)
     sd_resize = gr.Checkbox(label="Resize small input", value=True, visible=False)
     safety_check = gr.Checkbox(label="Enable Safety Checker", value=True, visible=False)
-    interrogate_check = gr.Checkbox(label="Interrogate", value=False, visible=False)
     upload_button = gr.Button(
         "Before uploading the image you need to setup the canvas first", visible=False
     )
@@ -1099,14 +966,6 @@ with blocks as demo:
             except Exception as e:
                 print(e)
                 return {token: gr.update(value=str(e))}
-            if model_choice in [
-                ModelChoice.INPAINTING.value,
-                ModelChoice.INPAINTING_IMG2IMG.value,
-                ModelChoice.INPAINTING2.value,
-            ]:
-                init_val = "cv2_ns"
-            else:
-                init_val = "patchmatch"
             return {
                 token: gr.update(visible=False),
                 canvas_width: gr.update(visible=False),
@@ -1117,7 +976,6 @@ with blocks as demo:
                 upload_button: gr.update(value="Upload Image"),
                 model_selection: gr.update(visible=False),
                 model_path_input: gr.update(visible=False),
-                init_mode: gr.update(value=init_val),
             }
 
         setup_button.click(
@@ -1140,7 +998,6 @@ with blocks as demo:
                 upload_button,
                 model_selection,
                 model_path_input,
-                init_mode,
             ],
             _js=setup_button_js,
         )
@@ -1164,15 +1021,13 @@ with blocks as demo:
             sd_generate_num,
             sd_scheduler,
             sd_scheduler_eta,
-            interrogate_check,
             model_output_state,
         ],
         outputs=[model_output, sd_prompt, model_output_state],
         _js=proceed_button_js,
     )
     # cancel button can also remove error overlay
-    if tuple(map(int,gr.__version__.split("."))) >= (3,6):
-        cancel_button.click(fn=None, inputs=None, outputs=None, cancels=[proceed_event])
+    # cancel_button.click(fn=None, inputs=None, outputs=None, cancels=[proceed_event])
 
 
 launch_extra_kwargs = {
@@ -1184,7 +1039,6 @@ launch_kwargs = {k: v for k, v in launch_kwargs.items() if v is not None}
 launch_kwargs.pop("remote_model", None)
 launch_kwargs.pop("local_model", None)
 launch_kwargs.pop("fp32", None)
-launch_kwargs.pop("lowvram", None)
 launch_kwargs.update(launch_extra_kwargs)
 try:
     import google.colab
